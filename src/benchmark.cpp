@@ -69,13 +69,15 @@ struct SimpleLatencyRecorder {
 int main(int argc, char** argv) {
     uint64_t total_orders = 1000000;
     uint64_t warmup_orders = 100000;
+    size_t num_producers = 4;
     size_t num_symbols = 5;
     size_t num_traders = 3;
 
     if (argc > 1) total_orders = std::stoull(argv[1]);
     if (argc > 2) warmup_orders = std::stoull(argv[2]);
-    if (argc > 3) num_symbols = std::min<size_t>(std::stoul(argv[3]), 5);
-    if (argc > 4) num_traders = std::stoul(argv[4]);
+    if (argc > 3) num_producers = std::stoul(argv[3]);
+    if (argc > 4) num_symbols = std::min<size_t>(std::stoul(argv[4]), 5);
+    if (argc > 5) num_traders = std::stoul(argv[5]);
 
     TscClock::instance().calibrate();
 
@@ -98,22 +100,23 @@ int main(int argc, char** argv) {
 
     std::atomic<uint64_t> warmup_reports_seen{0};
     std::atomic<bool> in_warmup{true};
+    std::atomic<uint64_t> global_order_id{1};
 
-    // 1. Order Generator Thread
-    std::thread gen_thread([&]() {
-        std::mt19937_64 rng(42);
+    // Helper lambda for producer thread order generation
+    auto run_producer_batch = [&](uint64_t count, size_t producer_id) {
+        std::mt19937_64 rng(42 + producer_id * 1000);
         std::uniform_int_distribution<int> price_offset(-15, 15);
         std::uniform_int_distribution<int> qty_dist(10, 500);
 
-        // --- PHASE 1: WARMUP ORDERS ---
-        for (uint64_t i = 1; i <= warmup_orders; ++i) {
+        for (uint64_t i = 0; i < count; ++i) {
+            uint64_t oid = global_order_id.fetch_add(1, std::memory_order_relaxed);
             int trader_id = static_cast<int>(rng() % num_traders + 1);
             size_t sym_idx = rng() % num_symbols;
             const auto& sym = SYMBOLS[sym_idx];
             Side side = (rng() % 2 == 0) ? Side::BUY : Side::SELL;
 
             Order o{};
-            o.id = i;
+            o.id = oid;
             o.trader_id = trader_id;
             o.rtype = RequestType::NEW;
             std::memcpy(o.symbol, sym.name, 8);
@@ -127,9 +130,23 @@ int main(int argc, char** argv) {
                 ++order_q.queue_spins_in;
             }
         }
+    };
 
-        // Wait for warmup orders to clear report queue
-        while (warmup_reports_seen.load() < warmup_orders) {
+    // 1. Multi-Producer Manager Thread
+    std::thread gen_manager([&]() {
+        // --- PHASE 1: MULTI-PRODUCER WARMUP ---
+        uint64_t warmup_per_producer = warmup_orders / num_producers;
+        std::vector<std::thread> warmup_producers;
+        warmup_producers.reserve(num_producers);
+        for (size_t p = 0; p < num_producers; ++p) {
+            warmup_producers.emplace_back(run_producer_batch, warmup_per_producer, p);
+        }
+        for (auto& t : warmup_producers) {
+            t.join();
+        }
+
+        // Wait for all warmup orders to be acknowledged
+        while (warmup_reports_seen.load() < warmup_per_producer * num_producers) {
             std::this_thread::yield();
         }
 
@@ -147,33 +164,23 @@ int main(int argc, char** argv) {
         report_q.queue_spins_in.store(0);
         report_q.queue_spins_out.store(0);
 
-        std::cout << "[Warmup Complete: " << warmup_orders << " orders. Starting Steady-State Profiling...]\n\n";
+        std::cout << "[Warmup Complete: " << warmup_per_producer * num_producers 
+                  << " orders across " << num_producers << " concurrent producer threads.]\n"
+                  << "[Starting True MPSC Multi-Producer Profiling...]\n\n";
 
-        // --- PHASE 2: REAL PROFILING ORDERS ---
-        for (uint64_t i = warmup_orders + 1; i <= warmup_orders + total_orders; ++i) {
-            int trader_id = static_cast<int>(rng() % num_traders + 1);
-            size_t sym_idx = rng() % num_symbols;
-            const auto& sym = SYMBOLS[sym_idx];
-            Side side = (rng() % 2 == 0) ? Side::BUY : Side::SELL;
-
-            Order o{};
-            o.id = i;
-            o.trader_id = trader_id;
-            o.rtype = RequestType::NEW;
-            std::memcpy(o.symbol, sym.name, 8);
-            o.side = side;
-            o.type = OrderType::LIMIT;
-            o.price = sym.base_price + price_offset(rng);
-            o.qty = qty_dist(rng);
-            o.t_created = now_tsc();
-
-            while (!order_q.push(o)) {
-                ++order_q.queue_spins_in;
-            }
+        // --- PHASE 2: MULTI-PRODUCER PROFILING ---
+        uint64_t profile_per_producer = total_orders / num_producers;
+        std::vector<std::thread> profile_producers;
+        profile_producers.reserve(num_producers);
+        for (size_t p = 0; p < num_producers; ++p) {
+            profile_producers.emplace_back(run_producer_batch, profile_per_producer, p);
+        }
+        for (auto& t : profile_producers) {
+            t.join();
         }
     });
 
-    // 2. Matching Engine Thread
+    // 2. Matching Engine Thread (Consumer)
     std::thread match_thread([&]() {
         engine.run();
     });
@@ -210,6 +217,7 @@ int main(int argc, char** argv) {
     // 4. Report Collector Thread
     std::thread report_thread([&]() {
         ExecutionReport r;
+        uint64_t warmup_target = (warmup_orders / num_producers) * num_producers;
         while (true) {
             while (!report_q.pop(r)) {
                 if (!in_warmup.load()) {
@@ -220,7 +228,7 @@ int main(int argc, char** argv) {
             if (r.trader_id == -1) break;
 
             if (r.type == ExecType::ACK) {
-                if (r.id <= warmup_orders) {
+                if (r.id <= warmup_target) {
                     warmup_reports_seen.fetch_add(1);
                 }
             }
@@ -233,8 +241,8 @@ int main(int argc, char** argv) {
 
     uint64_t start_cycles = now_tsc();
 
-    // Wait for generator to finish pushing all orders
-    gen_thread.join();
+    // Wait for all producer threads to finish
+    gen_manager.join();
 
     // Shutdown matching engine
     Order shutdown{};

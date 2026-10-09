@@ -43,12 +43,11 @@ void OrderBook::match(Order& o, uint64_t& trade_id,
 
 void OrderBook::try_match_buy(Order& o, uint64_t& trade_id,
                                SPSCQueue<Trade>& trade_q_, MPSCQueue<ExecutionReport>& report_q_) {
-    // Match against asks (ascending price order)
-    while (o.qty > 0 && !asks_.empty()) {
-        auto it = asks_.begin();
-        if (o.type == OrderType::LIMIT && it->first > o.price) break;
+    // Match against asks from the lowest active price level.
+    while (o.qty > 0 && best_ask_ < MAX_PRICE) {
+        if (o.type == OrderType::LIMIT && best_ask_ > o.price) break;
 
-        PriceLevel& level = it->second;
+        PriceLevel& level = asks_[best_ask_];
         while (o.qty > 0 && !level.empty()) {
             OrderNode* resting = level.head;
             int traded = std::min(o.qty, resting->qty);
@@ -102,7 +101,9 @@ void OrderBook::try_match_buy(Order& o, uint64_t& trade_id,
             }
         }
         if (level.empty()) {
-            asks_.erase(it);
+            do {
+                ++best_ask_;
+            } while (best_ask_ < MAX_PRICE && asks_[best_ask_].empty());
         }
     }
 
@@ -112,6 +113,7 @@ void OrderBook::try_match_buy(Order& o, uint64_t& trade_id,
         if (node) {
             bids_[o.price].push_back(node);
             bids_[o.price].price = o.price;
+            if (o.price > best_bid_) best_bid_ = o.price;
             order_index_[o.id] = node;
         }
     }
@@ -119,12 +121,11 @@ void OrderBook::try_match_buy(Order& o, uint64_t& trade_id,
 
 void OrderBook::try_match_sell(Order& o, uint64_t& trade_id,
                                 SPSCQueue<Trade>& trade_q_, MPSCQueue<ExecutionReport>& report_q_) {
-    // Match against bids (descending price order via std::greater)
-    while (o.qty > 0 && !bids_.empty()) {
-        auto it = bids_.begin();
-        if (o.type == OrderType::LIMIT && it->first < o.price) break;
+    // Match against bids from the highest active price level.
+    while (o.qty > 0 && best_bid_ >= 0) {
+        if (o.type == OrderType::LIMIT && best_bid_ < o.price) break;
 
-        PriceLevel& level = it->second;
+        PriceLevel& level = bids_[best_bid_];
         while (o.qty > 0 && !level.empty()) {
             OrderNode* resting = level.head;
             int traded = std::min(o.qty, resting->qty);
@@ -178,7 +179,9 @@ void OrderBook::try_match_sell(Order& o, uint64_t& trade_id,
             }
         }
         if (level.empty()) {
-            bids_.erase(it);
+            do {
+                --best_bid_;
+            } while (best_bid_ >= 0 && bids_[best_bid_].empty());
         }
     }
 
@@ -188,6 +191,7 @@ void OrderBook::try_match_sell(Order& o, uint64_t& trade_id,
         if (node) {
             asks_[o.price].push_back(node);
             asks_[o.price].price = o.price;
+            if (o.price < best_ask_) best_ask_ = o.price;
             order_index_[o.id] = node;
         }
     }
@@ -204,16 +208,20 @@ bool OrderBook::cancel(uint64_t id, MPSCQueue<ExecutionReport>& report_q_) {
     OrderNode* node = idx->second;
 
     if (node->side == Side::BUY) {
-        auto book_it = bids_.find(node->price);
-        if (book_it != bids_.end()) {
-            book_it->second.remove(node);
-            if (book_it->second.empty()) bids_.erase(book_it);
+        PriceLevel& level = bids_[node->price];
+        level.remove(node);
+        if (level.empty() && node->price == best_bid_) {
+            do {
+                --best_bid_;
+            } while (best_bid_ >= 0 && bids_[best_bid_].empty());
         }
     } else {
-        auto book_it = asks_.find(node->price);
-        if (book_it != asks_.end()) {
-            book_it->second.remove(node);
-            if (book_it->second.empty()) asks_.erase(book_it);
+        PriceLevel& level = asks_[node->price];
+        level.remove(node);
+        if (level.empty() && node->price == best_ask_) {
+            do {
+                ++best_ask_;
+            } while (best_ask_ < MAX_PRICE && asks_[best_ask_].empty());
         }
     }
 
@@ -260,6 +268,8 @@ bool OrderBook::modify(Order& o, uint64_t& trade_id,
 
     // Same price: in-place qty update, no re-insertion needed
     if (o.price == old_price) {
+        PriceLevel& level = (node->side == Side::BUY) ? bids_[old_price] : asks_[old_price];
+        level.total_qty += o.qty - node->qty;
         node->qty = o.qty;
         push_modified(node);
         return true;
@@ -267,16 +277,20 @@ bool OrderBook::modify(Order& o, uint64_t& trade_id,
 
     // Price changed: remove from old level, re-match at new price
     if (node->side == Side::BUY) {
-        auto book_it = bids_.find(node->price);
-        if (book_it != bids_.end()) {
-            book_it->second.remove(node);
-            if (book_it->second.empty()) bids_.erase(book_it);
+        PriceLevel& level = bids_[node->price];
+        level.remove(node);
+        if (level.empty() && node->price == best_bid_) {
+            do {
+                --best_bid_;
+            } while (best_bid_ >= 0 && bids_[best_bid_].empty());
         }
     } else {
-        auto book_it = asks_.find(node->price);
-        if (book_it != asks_.end()) {
-            book_it->second.remove(node);
-            if (book_it->second.empty()) asks_.erase(book_it);
+        PriceLevel& level = asks_[node->price];
+        level.remove(node);
+        if (level.empty() && node->price == best_ask_) {
+            do {
+                ++best_ask_;
+            } while (best_ask_ < MAX_PRICE && asks_[best_ask_].empty());
         }
     }
     order_index_.erase(idx);
@@ -287,7 +301,10 @@ bool OrderBook::modify(Order& o, uint64_t& trade_id,
     updated.qty = o.qty;
     updated.price = o.price;
     match(updated, trade_id, trade_q_, report_q_);
-    push_modified(order_index_.count(o.id) ? order_index_[o.id] : nullptr);
+    auto modified_idx = order_index_.find(o.id);
+    if (modified_idx != order_index_.end()) {
+        push_modified(modified_idx->second);
+    }
     return true;
 }
 

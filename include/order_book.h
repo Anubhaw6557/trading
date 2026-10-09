@@ -3,7 +3,6 @@
 #include "report.h"
 #include "spsc_queue.h"
 #include "mpsc_queue.h"
-#include <map>
 #include <vector>
 #include <unordered_map>
 #include <cstring>
@@ -91,12 +90,15 @@ struct PriceLevel {
     }
 };
 
+constexpr int MAX_PRICE = 500000;
+
 // ============================================================================
 // OrderBook: Price-time priority order book with O(1) operations.
 // ============================================================================
 class OrderBook {
 public:
-    explicit OrderBook(ObjectPool<OrderNode>* pool = nullptr) : pool_(pool) {}
+    explicit OrderBook(ObjectPool<OrderNode>* pool = nullptr)
+        : bids_(MAX_PRICE), asks_(MAX_PRICE), pool_(pool) {}
 
     void set_pool(ObjectPool<OrderNode>* pool) { pool_ = pool; }
 
@@ -107,8 +109,10 @@ public:
                 SPSCQueue<Trade>& trade_q, MPSCQueue<ExecutionReport>& report_q);
 
 private:
-    std::map<int, PriceLevel, std::greater<int>> bids_;
-    std::map<int, PriceLevel> asks_;
+    std::vector<PriceLevel> bids_;
+    std::vector<PriceLevel> asks_;
+    int best_bid_ = -1;
+    int best_ask_ = MAX_PRICE;
 
     std::unordered_map<uint64_t, OrderNode*> order_index_;
 

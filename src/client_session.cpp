@@ -3,6 +3,7 @@
 #include <thread>
 #include "message.h"
 #include <utility>
+#include <cstring>
 
 ClientSession::ClientSession(boost::asio::ip::tcp::socket socket,int trader_id,MPSCQueue<Order> &order_q,ReportDispatcher &dispatcher,MPSCQueue<Pnlrequest> &pnl_q)
     : socket_(std::move(socket)),
@@ -38,9 +39,9 @@ void ClientSession::readerLoop(){
             registered_ = true;
         }
         if(msg.type == MessageType::PNL){
-            Pnlrequest request;
+            Pnlrequest request{};
             request.trader_id = trader_id_;
-            request.symbol = msg.symbol;
+            std::memcpy(request.symbol, msg.symbol, 8);
             while(!pnl_q_.push(request)){
                 ++pnl_q_.queue_spins_in;
                 std::this_thread::yield();
@@ -62,28 +63,29 @@ void ClientSession::writerLoop(){
         while(!report_q_.pop(r)){
             ++report_q_.queue_spins_out;
         }
+        std::string sym = get_symbol(r.symbol);
         std::string response;
         switch (r.type){
             case ExecType::ACK :
-                response = "ACK," + std::to_string(r.id) + "," +r.symbol+ "\n";
+                response = "ACK," + std::to_string(r.id) + "," + sym + "\n";
                 break;
             case ExecType::FILL :
-                response = "FILL," + std::to_string(r.id)+ "," +r.symbol +"," + std::to_string(r.fillqty)+"," + std::to_string(r.price) + "\n";
+                response = "FILL," + std::to_string(r.id)+ "," + sym + "," + std::to_string(r.fillqty)+"," + std::to_string(r.price) + "\n";
                 break;
             case ExecType::PARTIAL_FILL :
-                response = "PARTIAL_FILL," + std::to_string(r.id)+ "," +r.symbol +"," + std::to_string(r.fillqty)+"," + std::to_string(r.price) + "\n";
+                response = "PARTIAL_FILL," + std::to_string(r.id)+ "," + sym + "," + std::to_string(r.fillqty)+"," + std::to_string(r.price) + "\n";
                 break;
             case ExecType::CANCELLED :
-                response = "CANCELLED," + std::to_string(r.id)+ "," +r.symbol  + "\n";
+                response = "CANCELLED," + std::to_string(r.id)+ "," + sym + "\n";
                 break;
             case ExecType::REJECT :
-                response = "REJECT," + std::to_string(r.id)+ "," +r.symbol  + "\n";
+                response = "REJECT," + std::to_string(r.id)+ "," + sym + "\n";
                 break;
             case ExecType::MODIFIED :
-                response = "MODIFIED," + std::to_string(r.id)+ "," +r.symbol  + "," + std::to_string(r.remqty) + "," + std::to_string(r.price) + "\n";
+                response = "MODIFIED," + std::to_string(r.id)+ "," + sym + "," + std::to_string(r.remqty) + "," + std::to_string(r.price) + "\n";
                 break;
             case ExecType::PNL_UPDATE:
-                response = "PNL_UPDATE," +r.symbol  + "," + std::to_string(r.pos) + ",$" + std::to_string(r.cash) + "\n";
+                response = "PNL_UPDATE," + sym + "," + std::to_string(r.pos) + ",$" + std::to_string(r.cash) + "\n";
                 break;
             default :
                 continue;

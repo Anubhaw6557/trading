@@ -3,7 +3,13 @@
 #include <cstdint>
 #include <chrono>
 #include <thread>
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <x86intrin.h>
+#define ARCH_X86 1
+#elif defined(__aarch64__)
+#define ARCH_ARM64 1
+#endif
 
 class TscClock {
 public:
@@ -13,6 +19,7 @@ public:
     }
 
     void calibrate() {
+#if defined(ARCH_X86)
         constexpr int samples = 5;
         double total = 0.0;
         for (int i = 0; i < samples; ++i) {
@@ -26,13 +33,27 @@ public:
             if (cycles > 0) total += static_cast<double>(ns) / static_cast<double>(cycles);
         }
         ns_per_cycle_ = total / samples;
-        start_cycles_ = rdtscp();
-        start_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+#elif defined(ARCH_ARM64)
+        uint64_t freq = arm64_cntfrq();
+        if (freq > 0) {
+            ns_per_cycle_ = 1e9 / static_cast<double>(freq);
+        } else {
+            ns_per_cycle_ = 1.0;
+        }
+#else
+        ns_per_cycle_ = 1.0;
+#endif
     }
 
     uint64_t now_cycles() const {
+#if defined(ARCH_X86)
         return rdtscp();
+#elif defined(ARCH_ARM64)
+        return arm64_cntvct();
+#else
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
     }
 
     uint64_t cycles_to_ns(uint64_t cycles) const {
@@ -40,7 +61,7 @@ public:
     }
 
     uint64_t elapsed_ns(uint64_t start_cycles) const {
-        return cycles_to_ns(rdtscp() - start_cycles);
+        return cycles_to_ns(now_cycles() - start_cycles);
     }
 
     double ns_per_cycle() const { return ns_per_cycle_; }
@@ -48,14 +69,25 @@ public:
 private:
     TscClock() = default;
 
+#if defined(ARCH_X86)
     static uint64_t rdtscp() {
         unsigned int aux;
         return __rdtscp(&aux);
     }
+#elif defined(ARCH_ARM64)
+    static uint64_t arm64_cntvct() {
+        uint64_t val;
+        asm volatile("mrs %0, cntvct_el0" : "=r"(val));
+        return val;
+    }
+    static uint64_t arm64_cntfrq() {
+        uint64_t val;
+        asm volatile("mrs %0, cntfrq_el0" : "=r"(val));
+        return val;
+    }
+#endif
 
     double ns_per_cycle_ = 1.0;
-    uint64_t start_cycles_ = 0;
-    uint64_t start_ns_ = 0;
 };
 
 inline uint64_t now_tsc() {

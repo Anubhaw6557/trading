@@ -13,7 +13,7 @@ struct Message{
     MessageType type = MessageType::NEW;
     uint64_t orderId = 0;
     Side side = Side::BUY;
-    std::string symbol;
+    char symbol[8] = {0};
     int quantity = 0;
     int price = 0;
     OrderType orderType = OrderType::LIMIT;

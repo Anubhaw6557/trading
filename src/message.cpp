@@ -1,19 +1,20 @@
 #include "message.h"
 #include "rdtsc.h"
+#include <cstring>
 
 Order MessageConverter::toOrder(const Message &msg){
     Order order;
     if(msg.type == MessageType::CANCEL){
         order.rtype = RequestType::CANCEL;
         order.id = msg.orderId;
-        order.symbol = msg.symbol;
+        std::memcpy(order.symbol, msg.symbol, 8);
         order.type = OrderType::LIMIT;
         return order;
     }
     if(msg.type == MessageType::MODIFY){
         order.rtype = RequestType::MODIFY;
         order.id = msg.orderId;
-        order.symbol = msg.symbol;
+        std::memcpy(order.symbol, msg.symbol, 8);
         order.price = msg.price;
         order.qty = msg.quantity;
         order.type = OrderType::LIMIT;
@@ -21,7 +22,7 @@ Order MessageConverter::toOrder(const Message &msg){
     }
     order.rtype = RequestType::NEW;
     order.id = msg.orderId;
-    order.symbol = msg.symbol;
+    std::memcpy(order.symbol, msg.symbol, 8);
     order.trader_id = 1;
     order.side = msg.side;
     order.type = msg.orderType;
@@ -31,5 +32,4 @@ Order MessageConverter::toOrder(const Message &msg){
     order.t_emitted = 0;
     order.t_matched = 0;
     return order;
-
 }

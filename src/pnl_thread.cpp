@@ -6,6 +6,7 @@
 #include "rdtsc.h"
 #include <unordered_map>
 #include <iostream>
+#include <cstring>
 
 struct PnL {
     int64_t cash = 0;
@@ -25,8 +26,9 @@ void pnl_thread(SPSCQueue<Trade>& tq,MPSCQueue<Pnlrequest> &pnl_q,MPSCQueue<Exec
             if (t.trade_buyer_id == -1 || t.trade_seller_id == -1){
                 break;
             }
-            auto& buyer = pnl[t.trade_buyer_id][t.symbol];
-            auto& seller = pnl[t.trade_seller_id][t.symbol];
+            std::string sym = get_symbol(t.symbol);
+            auto& buyer = pnl[t.trade_buyer_id][sym];
+            auto& seller = pnl[t.trade_seller_id][sym];
             buyer.cash -= int64_t(t.price) * t.qty;
             buyer.pos += t.qty;
             seller.cash += int64_t(t.price) * t.qty;
@@ -38,11 +40,12 @@ void pnl_thread(SPSCQueue<Trade>& tq,MPSCQueue<Pnlrequest> &pnl_q,MPSCQueue<Exec
         }
         if(pnl_q.pop(req)){
             work = true;
-            auto& data = pnl[req.trader_id][req.symbol];
-            ExecutionReport rep;
+            std::string sym = get_symbol(req.symbol);
+            auto& data = pnl[req.trader_id][sym];
+            ExecutionReport rep{};
             rep.type = ExecType::PNL_UPDATE;
             rep.trader_id = req.trader_id;
-            rep.symbol = req.symbol;
+            std::memcpy(rep.symbol, req.symbol, 8);
             rep.cash = data.cash;
             rep.pos = data.pos;
             while(!report_q.push(rep)){

@@ -30,7 +30,7 @@ enum class ExecType{
 struct ExecutionReport{
     ExecType type;
     uint64_t id = 0;
-    std::string symbol;
+    char symbol[8] = {0};
     int fillqty = 0;
     int remqty = 0;
     int price = 0;

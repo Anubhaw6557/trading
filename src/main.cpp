@@ -19,10 +19,10 @@ static inline uint64_t now_ns() {
 }
 
 int main() {
-    constexpr size_t Order_queue_size = 1<<11;
-    constexpr size_t Trade_queue_size = 1<<11;
-    constexpr size_t Report_queue_size = 1<<11;
-    constexpr size_t Pnl_queue_size = 1<<11;
+    constexpr size_t Order_queue_size = 1 << 16;
+    constexpr size_t Trade_queue_size = 1 << 16;
+    constexpr size_t Report_queue_size = 1 << 16;
+    constexpr size_t Pnl_queue_size = 1 << 16;
     MPSCQueue<Order> order_q(Order_queue_size);
     MPSCQueue<Pnlrequest> pnl_q(Pnl_queue_size);
     SPSCQueue<Trade> trade_q(Trade_queue_size);

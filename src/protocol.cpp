@@ -3,6 +3,7 @@
 #include <sstream>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
 static std::string trim(std::string s){
     while(!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')){
@@ -26,7 +27,7 @@ Message Protocol::parse(const std::string &data){
     if(fields.size() == 2){
         if(fields[0] == "PNL"){
             msg.type = MessageType::PNL;
-            msg.symbol = fields[1];
+            set_symbol(msg.symbol, fields[1]);
             return msg;
         }
     }
@@ -34,7 +35,7 @@ Message Protocol::parse(const std::string &data){
         if(fields[0] == "CANCEL"){
             msg.type = MessageType::CANCEL;
             msg.orderId = std::stoull(fields[1]);
-            msg.symbol = fields[2];
+            set_symbol(msg.symbol, fields[2]);
             return msg;
         } 
     }
@@ -42,7 +43,7 @@ Message Protocol::parse(const std::string &data){
         if(fields[0] == "MODIFY"){
             msg.type = MessageType::MODIFY;
             msg.orderId = std::stoull(fields[1]);
-            msg.symbol = fields[2];
+            set_symbol(msg.symbol, fields[2]);
             msg.quantity = std::stoi(fields[3]);
             msg.price = std::stoi(fields[4]);
             return msg;
@@ -53,7 +54,7 @@ Message Protocol::parse(const std::string &data){
     msg.orderId = std::stoull(fields[1]);
     if(fields[2] == "BUY") msg.side = Side::BUY;
     else msg.side = Side::SELL;
-    msg.symbol = fields[3];
+    set_symbol(msg.symbol, fields[3]);
     msg.quantity =std::stoi(fields[4]);
     msg.price = std::stoi(fields[5]);
     return msg;

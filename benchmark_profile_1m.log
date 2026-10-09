@@ -1,0 +1,94 @@
+[Warmup Complete: 100000 orders across 4 concurrent producer threads.]
+[Starting True MPSC Multi-Producer Profiling...]
+
+No. of trades == 857703
+Execution Summary
+
+Total Orders Executed: 1000000
+
+Total Trades Executed: 778180
+
+Profit & Loss (PnL)
+Trader 1
+
+A — Cash: 779355412 | Position: -51949
+
+B — Cash: 18361030550 | Position: -65574
+
+C — Cash: -4002695740 | Position: 133402
+
+D — Cash: -6233584692 | Position: 19478
+
+E — Cash: 447507050 | Position: -17888
+
+Trader 2
+
+A — Cash: 721718665 | Position: -48140
+
+B — Cash: -14154363040 | Position: 50547
+
+C — Cash: 1616857519 | Position: -53891
+
+D — Cash: 10872468877 | Position: -33975
+
+E — Cash: 294311487 | Position: -11750
+
+Trader 3
+
+A — Cash: -1501074077 | Position: 100089
+
+B — Cash: -4206667510 | Position: 15027
+
+C — Cash: 2385838221 | Position: -79511
+
+D — Cash: -4638884185 | Position: 14497
+
+E — Cash: -741818537 | Position: 29638
+
+Latency Metrics (nanoseconds)
+Ingress (Market Replay → Order Queue)
+
+p50: 60588697 ns
+
+p99: 98614218 ns
+
+max: 106768125 ns
+
+Matching Engine
+
+p50: 364 ns
+
+p99: 1875 ns
+
+max: 10737812 ns
+
+Metrics / PnL Updates
+
+p50: 23177 ns
+
+p99: 9333177 ns
+
+max: 12353020 ns
+
+--- Queue Spin Statistics ---
+
+Order Queue
+  Producer spins (push):  10992078
+  Consumer spins (pop):   11208
+
+Trade Queue
+  Producer spins (push):  0
+  Consumer spins (pop): 0
+
+Total time for execution : 1106451250 ns
+
+
+Stage timing from profiling start
+
+  Producers complete: 864645937 ns
+  Matcher complete:   902588593 ns
+  PnL complete:       902588333 ns
+  Reports complete:   902825416 ns
+
+Throughput for orders : 903790.38390
+

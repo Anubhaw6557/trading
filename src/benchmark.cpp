@@ -16,6 +16,10 @@
 #include <algorithm>
 #include <iomanip>
 #include <cstring>
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace {
 
@@ -64,6 +68,40 @@ struct SimpleLatencyRecorder {
     }
 };
 
+bool pin_current_thread(size_t logical_cpu) {
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return false;
+
+    size_t available_count = 0;
+    for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed)) ++available_count;
+    }
+    if (available_count == 0) return false;
+
+    const size_t target = logical_cpu % available_count;
+    size_t current = 0;
+    unsigned selected_cpu = 0;
+    for (unsigned cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) continue;
+        if (current++ == target) {
+            selected_cpu = cpu;
+            break;
+        }
+    }
+
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    CPU_SET(selected_cpu, &affinity);
+    return pthread_setaffinity_np(
+        pthread_self(), sizeof(affinity), &affinity) == 0;
+#else
+    (void)logical_cpu;
+    return false;
+#endif
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -100,16 +138,23 @@ int main(int argc, char** argv) {
 
     std::atomic<uint64_t> warmup_reports_seen{0};
     std::atomic<bool> in_warmup{true};
-    std::atomic<uint64_t> global_order_id{1};
+    std::atomic<uint64_t> profile_start_cycles{0};
+    std::atomic<uint64_t> producer_end_cycles{0};
+    std::atomic<uint64_t> matcher_end_cycles{0};
+    std::atomic<uint64_t> pnl_end_cycles{0};
+    std::atomic<uint64_t> report_end_cycles{0};
+    std::vector<uint64_t> producer_full_retries(num_producers, 0);
 
     // Helper lambda for producer thread order generation
-    auto run_producer_batch = [&](uint64_t count, size_t producer_id) {
+    auto run_producer_batch = [&](uint64_t count, size_t producer_id, uint64_t id_base) {
+        pin_current_thread(producer_id + 1);
+        uint64_t next_order_id = id_base;
         std::mt19937_64 rng(42 + producer_id * 1000);
         std::uniform_int_distribution<int> price_offset(-15, 15);
         std::uniform_int_distribution<int> qty_dist(10, 500);
 
         for (uint64_t i = 0; i < count; ++i) {
-            uint64_t oid = global_order_id.fetch_add(1, std::memory_order_relaxed);
+            uint64_t oid = next_order_id++;
             int trader_id = static_cast<int>(rng() % num_traders + 1);
             size_t sym_idx = rng() % num_symbols;
             const auto& sym = SYMBOLS[sym_idx];
@@ -127,7 +172,7 @@ int main(int argc, char** argv) {
             o.t_created = now_tsc();
 
             while (!order_q.push(o)) {
-                ++order_q.queue_spins_in;
+                ++producer_full_retries[producer_id];
             }
         }
     };
@@ -139,7 +184,8 @@ int main(int argc, char** argv) {
         std::vector<std::thread> warmup_producers;
         warmup_producers.reserve(num_producers);
         for (size_t p = 0; p < num_producers; ++p) {
-            warmup_producers.emplace_back(run_producer_batch, warmup_per_producer, p);
+            const uint64_t id_base = p * warmup_per_producer + 1;
+            warmup_producers.emplace_back(run_producer_batch, warmup_per_producer, p, id_base);
         }
         for (auto& t : warmup_producers) {
             t.join();
@@ -163,26 +209,38 @@ int main(int argc, char** argv) {
         trade_q.queue_spins_out.store(0);
         report_q.queue_spins_in.store(0);
         report_q.queue_spins_out.store(0);
+        std::fill(producer_full_retries.begin(), producer_full_retries.end(), 0);
 
         std::cout << "[Warmup Complete: " << warmup_per_producer * num_producers 
                   << " orders across " << num_producers << " concurrent producer threads.]\n"
                   << "[Starting True MPSC Multi-Producer Profiling...]\n\n";
 
         // --- PHASE 2: MULTI-PRODUCER PROFILING ---
+        profile_start_cycles.store(now_tsc(), std::memory_order_release);
         uint64_t profile_per_producer = total_orders / num_producers;
         std::vector<std::thread> profile_producers;
         profile_producers.reserve(num_producers);
         for (size_t p = 0; p < num_producers; ++p) {
-            profile_producers.emplace_back(run_producer_batch, profile_per_producer, p);
+            const uint64_t id_base = warmup_per_producer * num_producers
+                + p * profile_per_producer + 1;
+            profile_producers.emplace_back(run_producer_batch, profile_per_producer, p, id_base);
         }
         for (auto& t : profile_producers) {
             t.join();
         }
+        uint64_t total_full_retries = 0;
+        for (uint64_t local_full_retries : producer_full_retries) {
+            total_full_retries += local_full_retries;
+        }
+        order_q.queue_spins_in.store(total_full_retries, std::memory_order_relaxed);
+        producer_end_cycles.store(now_tsc(), std::memory_order_release);
     });
 
     // 2. Matching Engine Thread (Consumer)
     std::thread match_thread([&]() {
+        pin_current_thread(0);
         engine.run();
+        matcher_end_cycles.store(now_tsc(), std::memory_order_release);
     });
 
     // 3. Custom PnL Processor Thread
@@ -206,12 +264,15 @@ int main(int argc, char** argv) {
                     pnl_lat.add(t.t_emitted - t.t_created);
                     ++total_trades;
                 }
+            } else if (!in_warmup.load()) {
+                ++trade_q.queue_spins_out;
             }
             if (pnl_q.pop(req)) {
                 work = true;
             }
             if (!work) std::this_thread::yield();
         }
+        pnl_end_cycles.store(now_tsc(), std::memory_order_release);
     });
 
     // 4. Report Collector Thread
@@ -237,9 +298,8 @@ int main(int argc, char** argv) {
                 metrics.record(r.type);
             }
         }
+        report_end_cycles.store(now_tsc(), std::memory_order_release);
     });
-
-    uint64_t start_cycles = now_tsc();
 
     // Wait for all producer threads to finish
     gen_manager.join();
@@ -255,8 +315,12 @@ int main(int argc, char** argv) {
     pnl_processor_thread.join();
     report_thread.join();
 
-    uint64_t end_cycles = now_tsc();
-    uint64_t total_ns = TscClock::instance().cycles_to_ns(end_cycles - start_cycles);
+    const uint64_t profile_start = profile_start_cycles.load(std::memory_order_acquire);
+    const uint64_t end_cycles = now_tsc();
+    const uint64_t total_ns = TscClock::instance().cycles_to_ns(end_cycles - profile_start);
+    auto stage_ns = [profile_start](uint64_t end) {
+        return TscClock::instance().cycles_to_ns(end - profile_start);
+    };
 
     // Print in exact README.md format
     std::cout << "Execution Summary\n\n";
@@ -292,7 +356,18 @@ int main(int argc, char** argv) {
     std::cout << "  Producer spins (push):  " << trade_q.queue_spins_in.load() << "\n";
     std::cout << "  Consumer spins (pop): " << trade_q.queue_spins_out.load() << "\n\n";
 
-    std::cout << "Total time for execution : " << total_ns << " ns\n\n\n";
+    std::cout << "Warmup orders excluded from timing: "
+              << (warmup_orders / num_producers) * num_producers << "\n\n";
+    std::cout << "Steady-state profiling time: " << total_ns << " ns\n\n\n";
+    std::cout << "Stage timing from profiling start\n\n";
+    std::cout << "  Producers complete: "
+              << stage_ns(producer_end_cycles.load(std::memory_order_acquire)) << " ns\n";
+    std::cout << "  Matcher complete:   "
+              << stage_ns(matcher_end_cycles.load(std::memory_order_acquire)) << " ns\n";
+    std::cout << "  PnL complete:       "
+              << stage_ns(pnl_end_cycles.load(std::memory_order_acquire)) << " ns\n";
+    std::cout << "  Reports complete:   "
+              << stage_ns(report_end_cycles.load(std::memory_order_acquire)) << " ns\n\n";
     double throughput = (double)total_orders * 1e9 / (double)total_ns;
     std::cout << std::fixed << std::setprecision(5);
     std::cout << "Throughput for orders : " << throughput << "\n\n";

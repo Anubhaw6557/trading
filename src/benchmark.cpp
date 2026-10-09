@@ -68,12 +68,14 @@ struct SimpleLatencyRecorder {
 
 int main(int argc, char** argv) {
     uint64_t total_orders = 1000000;
+    uint64_t warmup_orders = 100000;
     size_t num_symbols = 5;
     size_t num_traders = 3;
 
     if (argc > 1) total_orders = std::stoull(argv[1]);
-    if (argc > 2) num_symbols = std::min<size_t>(std::stoul(argv[2]), 5);
-    if (argc > 3) num_traders = std::stoul(argv[3]);
+    if (argc > 2) warmup_orders = std::stoull(argv[2]);
+    if (argc > 3) num_symbols = std::min<size_t>(std::stoul(argv[3]), 5);
+    if (argc > 4) num_traders = std::stoul(argv[4]);
 
     TscClock::instance().calibrate();
 
@@ -94,7 +96,8 @@ int main(int argc, char** argv) {
     std::unordered_map<int, std::unordered_map<std::string, PnLEntry>> pnl_map;
     SimpleLatencyRecorder pnl_lat;
 
-    uint64_t start_cycles = now_tsc();
+    std::atomic<uint64_t> warmup_reports_seen{0};
+    std::atomic<bool> in_warmup{true};
 
     // 1. Order Generator Thread
     std::thread gen_thread([&]() {
@@ -102,7 +105,52 @@ int main(int argc, char** argv) {
         std::uniform_int_distribution<int> price_offset(-15, 15);
         std::uniform_int_distribution<int> qty_dist(10, 500);
 
-        for (uint64_t i = 1; i <= total_orders; ++i) {
+        // --- PHASE 1: WARMUP ORDERS ---
+        for (uint64_t i = 1; i <= warmup_orders; ++i) {
+            int trader_id = static_cast<int>(rng() % num_traders + 1);
+            size_t sym_idx = rng() % num_symbols;
+            const auto& sym = SYMBOLS[sym_idx];
+            Side side = (rng() % 2 == 0) ? Side::BUY : Side::SELL;
+
+            Order o{};
+            o.id = i;
+            o.trader_id = trader_id;
+            o.rtype = RequestType::NEW;
+            std::memcpy(o.symbol, sym.name, 8);
+            o.side = side;
+            o.type = OrderType::LIMIT;
+            o.price = sym.base_price + price_offset(rng);
+            o.qty = qty_dist(rng);
+            o.t_created = now_tsc();
+
+            while (!order_q.push(o)) {
+                ++order_q.queue_spins_in;
+            }
+        }
+
+        // Wait for warmup orders to clear report queue
+        while (warmup_reports_seen.load() < warmup_orders) {
+            std::this_thread::yield();
+        }
+
+        // --- RESET POINT BEFORE PROFILING ---
+        in_warmup.store(false);
+        engine.ingress_lat.v.clear();
+        engine.match_lat.v.clear();
+        pnl_lat.samples.clear();
+        total_trades.store(0);
+
+        order_q.queue_spins_in.store(0);
+        order_q.queue_spins_out.store(0);
+        trade_q.queue_spins_in.store(0);
+        trade_q.queue_spins_out.store(0);
+        report_q.queue_spins_in.store(0);
+        report_q.queue_spins_out.store(0);
+
+        std::cout << "[Warmup Complete: " << warmup_orders << " orders. Starting Steady-State Profiling...]\n\n";
+
+        // --- PHASE 2: REAL PROFILING ORDERS ---
+        for (uint64_t i = warmup_orders + 1; i <= warmup_orders + total_orders; ++i) {
             int trader_id = static_cast<int>(rng() % num_traders + 1);
             size_t sym_idx = rng() % num_symbols;
             const auto& sym = SYMBOLS[sym_idx];
@@ -147,10 +195,10 @@ int main(int argc, char** argv) {
                 seller.cash += int64_t(t.price) * t.qty;
                 seller.pos -= t.qty;
                 t.t_emitted = now_tsc();
-                if (t.t_emitted > t.t_created) {
+                if (!in_warmup.load() && t.t_emitted > t.t_created) {
                     pnl_lat.add(t.t_emitted - t.t_created);
+                    ++total_trades;
                 }
-                ++total_trades;
             }
             if (pnl_q.pop(req)) {
                 work = true;
@@ -164,13 +212,26 @@ int main(int argc, char** argv) {
         ExecutionReport r;
         while (true) {
             while (!report_q.pop(r)) {
-                ++report_q.queue_spins_out;
+                if (!in_warmup.load()) {
+                    ++report_q.queue_spins_out;
+                }
                 std::this_thread::yield();
             }
             if (r.trader_id == -1) break;
-            metrics.record(r.type);
+
+            if (r.type == ExecType::ACK) {
+                if (r.id <= warmup_orders) {
+                    warmup_reports_seen.fetch_add(1);
+                }
+            }
+
+            if (!in_warmup.load()) {
+                metrics.record(r.type);
+            }
         }
     });
+
+    uint64_t start_cycles = now_tsc();
 
     // Wait for generator to finish pushing all orders
     gen_thread.join();
